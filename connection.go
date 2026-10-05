@@ -77,7 +77,10 @@ type Connection struct {
 	inboundCtx    context.Context
 	inboundCancel context.CancelCauseFunc
 
-	logger *slog.Logger
+	// logger is read by the connection's goroutines, which NewConnection starts,
+	// so it is set atomically: by WithLogger before they start, or by SetLogger
+	// at any time.
+	logger atomic.Pointer[slog.Logger]
 
 	notifyMu sync.Mutex
 	// notifyCond coordinates response-scoped waits for sequential notification processing.
@@ -107,6 +110,7 @@ type connectionConfig struct {
 	maxQueuedNotifications int
 	notificationOverflow   NotificationOverflowPolicy
 	onNotificationDropped  func(method string, totalDropped uint64)
+	logger                 *slog.Logger
 }
 
 // WithMaxQueuedNotifications sets the maximum number of queued notifications
@@ -175,6 +179,17 @@ func WithNotificationDropHandler(fn func(method string, totalDropped uint64)) Co
 	}
 }
 
+// WithLogger directs the connection's internal diagnostics to l from the
+// start, before any message is read. It is the race-free way to set a logger:
+// a connection's goroutines begin reading the peer inside the constructor, so
+// a diagnostic can be logged before a later SetLogger call returns. A nil l
+// keeps the default logger.
+func WithLogger(l *slog.Logger) ConnectionOption {
+	return func(cfg *connectionConfig) {
+		cfg.logger = l
+	}
+}
+
 func NewConnection(handler MethodHandler, peerInput io.Writer, peerOutput io.Reader, opts ...ConnectionOption) *Connection {
 	cfg := connectionConfig{
 		maxQueuedNotifications: defaultMaxQueuedNotifications,
@@ -200,6 +215,9 @@ func NewConnection(handler MethodHandler, peerInput io.Writer, peerOutput io.Rea
 
 		notificationOverflow:  cfg.notificationOverflow,
 		onNotificationDropped: cfg.onNotificationDropped,
+	}
+	if cfg.logger != nil {
+		c.logger.Store(cfg.logger)
 	}
 	c.notifyCond = sync.NewCond(&c.notifyMu)
 	go func() {
@@ -232,12 +250,14 @@ func (c *Connection) dropNotification(method string) {
 }
 
 // SetLogger installs a logger used for internal connection diagnostics.
-// If unset, logs are written via the default logger.
-func (c *Connection) SetLogger(l *slog.Logger) { c.logger = l }
+// If unset, logs are written via the default logger. It is safe to call while
+// the connection runs, but diagnostics logged before it returns go to the
+// previous logger; use WithLogger to set one from the start.
+func (c *Connection) SetLogger(l *slog.Logger) { c.logger.Store(l) }
 
 func (c *Connection) loggerOrDefault() *slog.Logger {
-	if c.logger != nil {
-		return c.logger
+	if l := c.logger.Load(); l != nil {
+		return l
 	}
 	return slog.Default()
 }
